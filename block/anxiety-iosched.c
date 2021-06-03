@@ -1,15 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Anxiety IO scheduler
- *
- * Anxiety is designed for mobile devices that are latency
- * sensitive. It is based on the no-op scheduler with additional
- * tweaks and changes. Using Anxiety on Android devices with
- * interactive and realtime workloads has proven significantly
- * faster R/W speeds in smaller buffer sizes (ie. databases,
- * journals, raw assets, etc).
- *
- * Copyright (C) 2018-2019 Tyler Nijmeh <tylernij@gmail.com>
- * Copyright (C) 2018 kdrag0n <dragon@khronodragon.com>
+ * Anxiety IO Scheduler
+ * Copyright (c) 2020, Tyler Nijmeh <tylernij@gmail.com>
  */
 
 #include <linux/blkdev.h>
@@ -18,116 +10,141 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/init.h>
-#include <linux/fb.h>
 
-/* Default tunable values */
-#define	DEFAULT_MAX_WRITES_STARVED		2	/* Max times reads can starve a write */
-#define	DEFAULT_MAX_WRITES_STARVED_SUSPENDED	0	/* Ditto but during screen-off states */
+/* Batch this many synchronous requests at a time */
+#define	DEFAULT_SYNC_RATIO	(4)
+
+/* Run each batch this many times*/
+#define DEFAULT_BATCH_COUNT	(2)
+
+enum {
+	SYNC,
+	ASYNC
+};
 
 struct anxiety_data {
 	struct list_head queue[2];
-	uint16_t writes_starved;
-	struct notifier_block fb_notifier;
-	bool display_on;
 
 	/* Tunables */
-	uint8_t max_writes_starved;
-	uint8_t max_writes_starved_suspended;
+	uint8_t sync_ratio;
+	uint8_t batch_count;
 };
 
-static void anxiety_merged_requests(struct request_queue *q, struct request *rq, struct request *next)
+static inline struct request *anxiety_next_entry(struct list_head *queue)
 {
-	rq_fifo_clear(next);
+	return list_first_entry(queue, struct request,
+		queuelist);
 }
 
-static __always_inline struct request *anxiety_choose_request(struct anxiety_data *adata)
+static void anxiety_merged_requests(struct request_queue *q, struct request *rq,
+		struct request *next)
 {
-	/* Prioritize reads unless writes are exceedingly starved */
-	bool starved = adata->writes_starved > (adata->display_on ? adata->max_writes_starved_suspended : adata->max_writes_starved);
-
-	/* Handle a read request */
-	if (!starved && !list_empty(&adata->queue[READ])) {
-		adata->writes_starved++;
-		return rq_entry_fifo(adata->queue[READ].next);
-	}
-
-	/* Handle a write request */
-	if (!list_empty(&adata->queue[WRITE])) {
-		adata->writes_starved = 0;
-		return rq_entry_fifo(adata->queue[WRITE].next);
-	}
-
-	/* If there are no requests, then there is nothing to starve */
-	adata->writes_starved = 0;
-	return NULL;
+	list_del_init(&next->queuelist);
 }
 
-static int anxiety_dispatch(struct request_queue *q, int force)
+static inline int __anxiety_dispatch(struct request_queue *q,
+		struct request *rq)
 {
-	struct request *rq = anxiety_choose_request(q->elevator->elevator_data);
+	if (unlikely(!rq))
+		return -EINVAL;
 
-	if (!rq)
-		return 0;
-
-	rq_fifo_clear(rq);
-	elv_dispatch_add_tail(rq->q, rq);
-
-	return 1;
-}
-
-static void anxiety_add_request(struct request_queue *q, struct request *rq)
-{
-	const uint8_t dir = rq_data_dir(rq);
-
-	list_add_tail(&rq->queuelist, &((struct anxiety_data *) q->elevator->elevator_data)->queue[dir]);
-}
-
-static struct request *anxiety_former_request(struct request_queue *q, struct request *rq)
-{
-	const uint8_t dir = rq_data_dir(rq);
-
-	if (rq->queuelist.prev == &((struct anxiety_data *) q->elevator->elevator_data)->queue[dir])
-		return NULL;
-
-	return list_prev_entry(rq, queuelist);
-}
-
-static struct request *anxiety_latter_request(struct request_queue *q, struct request *rq)
-{
-	const uint8_t dir = rq_data_dir(rq);
-
-	if (rq->queuelist.next == &((struct anxiety_data *) q->elevator->elevator_data)->queue[dir])
-		return NULL;
-
-	return list_next_entry(rq, queuelist);
-}
-
-static int fb_notifier_callback(struct notifier_block *self,
-				unsigned long event, void *data)
-{
-	struct anxiety_data *adata = container_of(self, struct anxiety_data, fb_notifier);
-	struct fb_event *evdata = data;
-	int *blank;
-
-	if (evdata && evdata->data && event == FB_EVENT_BLANK) {
-		blank = evdata->data;
-		switch (*blank) {
-			case FB_BLANK_UNBLANK:
-				adata->display_on = true;
-				break;
-			case FB_BLANK_POWERDOWN:
-			case FB_BLANK_HSYNC_SUSPEND:
-			case FB_BLANK_VSYNC_SUSPEND:
-			case FB_BLANK_NORMAL:
-				adata->display_on = false;
-				break;
-		}
-	}
+	list_del_init(&rq->queuelist);
+	elv_dispatch_sort(q, rq);
 
 	return 0;
 }
 
-static int anxiety_init_queue(struct request_queue *q, struct elevator_type *elv)
+static uint16_t anxiety_dispatch_batch(struct request_queue *q)
+{
+	struct anxiety_data *adata = q->elevator->elevator_data;
+	uint8_t i, j;
+	uint16_t dispatched = 0;
+	int ret;
+
+	/* Perform each batch adata->batch_count many times */
+	for (i = 0; i < adata->batch_count; i++) {
+		/* Batch sync requests according to tunables */
+		for (j = 0; j < adata->sync_ratio; j++) {
+			if (list_empty(&adata->queue[SYNC]))
+				break;
+
+			ret = __anxiety_dispatch(q,
+				anxiety_next_entry(&adata->queue[SYNC]));
+
+			if (!ret)
+				dispatched++;
+		}
+
+		/* Submit one async request after the sync batch to avoid starvation */
+		if (!list_empty(&adata->queue[ASYNC])) {
+			ret = __anxiety_dispatch(q,
+				anxiety_next_entry(&adata->queue[ASYNC]));
+
+			if (!ret)
+				dispatched++;
+
+			dispatched++;
+		}
+
+		/* If we didn't have anything to dispatch; don't batch again */
+		if (!dispatched)
+			break;
+	}
+
+	return dispatched;
+}
+
+static uint16_t anxiety_dispatch_drain(struct request_queue *q)
+{
+	struct anxiety_data *adata = q->elevator->elevator_data;
+	uint16_t dispatched = 0;
+	int ret;
+
+	/*
+	 * Drain out all of the synchronous requests first,
+	 * then drain the asynchronous requests.
+	 */
+	while (!list_empty(&adata->queue[SYNC])) {
+		ret = __anxiety_dispatch(q,
+			anxiety_next_entry(&adata->queue[SYNC]));
+
+		if (!ret)
+			dispatched++;
+	}
+
+	while (!list_empty(&adata->queue[ASYNC])) {
+		ret = __anxiety_dispatch(q,
+			anxiety_next_entry(&adata->queue[ASYNC]));
+
+		if (!ret)
+			dispatched++;
+	}
+
+	return dispatched;
+}
+
+static int anxiety_dispatch(struct request_queue *q, int force)
+{
+	/*
+	 * When requested by the elevator, a full queue drain can be
+	 * performed in one scheduler dispatch.
+	 */
+	if (unlikely(force))
+		return anxiety_dispatch_drain(q);
+
+	return anxiety_dispatch_batch(q);
+}
+
+static void anxiety_add_request(struct request_queue *q, struct request *rq)
+{
+	const uint8_t dir = rq_is_sync(rq);
+	struct anxiety_data *adata = q->elevator->elevator_data;
+
+	list_add_tail(&rq->queuelist, &adata->queue[dir]);
+}
+
+static int anxiety_init_queue(struct request_queue *q,
+		struct elevator_type *elv)
 {
 	struct anxiety_data *adata;
 	struct elevator_queue *eq = elevator_alloc(q, elv);
@@ -146,14 +163,10 @@ static int anxiety_init_queue(struct request_queue *q, struct elevator_type *elv
 	eq->elevator_data = adata;
 
 	/* Initialize */
-	INIT_LIST_HEAD(&adata->queue[READ]);
-	INIT_LIST_HEAD(&adata->queue[WRITE]);
-	adata->writes_starved = 0;
-	adata->max_writes_starved = DEFAULT_MAX_WRITES_STARVED;
-	adata->max_writes_starved_suspended = DEFAULT_MAX_WRITES_STARVED_SUSPENDED;
-
-	adata->fb_notifier.notifier_call = fb_notifier_callback;
-	fb_register_client(&adata->fb_notifier);
+	INIT_LIST_HEAD(&adata->queue[SYNC]);
+	INIT_LIST_HEAD(&adata->queue[ASYNC]);
+	adata->sync_ratio = DEFAULT_SYNC_RATIO;
+	adata->batch_count = DEFAULT_BATCH_COUNT;
 
 	/* Set elevator to Anxiety */
 	spin_lock_irq(q->queue_lock);
@@ -163,57 +176,55 @@ static int anxiety_init_queue(struct request_queue *q, struct elevator_type *elv
 	return 0;
 }
 
-static void anxiety_exit_queue(struct elevator_queue *e)
-{
-	struct anxiety_data *adata = e->elevator_data;
-
-	fb_unregister_client(&adata->fb_notifier);
-
-	kfree(adata);
-}
-
 /* Sysfs access */
-static ssize_t anxiety_max_writes_starved_show(struct elevator_queue *e, char *page)
+static ssize_t anxiety_sync_ratio_show(struct elevator_queue *e, char *page)
 {
 	struct anxiety_data *adata = e->elevator_data;
 
-	return snprintf(page, PAGE_SIZE, "%u\n", adata->max_writes_starved);
+	return snprintf(page, PAGE_SIZE, "%u\n", adata->sync_ratio);
 }
 
-static ssize_t anxiety_max_writes_starved_store(struct elevator_queue *e, const char *page, size_t count)
+static ssize_t anxiety_sync_ratio_store(struct elevator_queue *e,
+		const char *page, size_t count)
 {
 	struct anxiety_data *adata = e->elevator_data;
 	int ret;
 
-	ret = kstrtou8(page, 0, &adata->max_writes_starved);
+	ret = kstrtou8(page, 0, &adata->sync_ratio);
 	if (ret < 0)
 		return ret;
 
 	return count;
 }
 
-static ssize_t anxiety_max_writes_starved_suspended_show(struct elevator_queue *e, char *page)
+static ssize_t anxiety_batch_count_show(struct elevator_queue *e, char *page)
 {
 	struct anxiety_data *adata = e->elevator_data;
 
-	return snprintf(page, PAGE_SIZE, "%u\n", adata->max_writes_starved_suspended);
+	return snprintf(page, PAGE_SIZE, "%u\n", adata->batch_count);
 }
 
-static ssize_t anxiety_max_writes_starved_suspended_store(struct elevator_queue *e, const char *page, size_t count)
+static ssize_t anxiety_batch_count_store(struct elevator_queue *e,
+		const char *page, size_t count)
 {
 	struct anxiety_data *adata = e->elevator_data;
 	int ret;
 
-	ret = kstrtou8(page, 0, &adata->max_writes_starved_suspended);
+	ret = kstrtou8(page, 0, &adata->batch_count);
 	if (ret < 0)
 		return ret;
+
+	if (adata->batch_count < 1)
+		adata->batch_count = 1;
 
 	return count;
 }
 
 static struct elv_fs_entry anxiety_attrs[] = {
-	__ATTR(max_writes_starved, 0644, anxiety_max_writes_starved_show, anxiety_max_writes_starved_store),
-	__ATTR(max_writes_starved_suspended, 0644, anxiety_max_writes_starved_suspended_show, anxiety_max_writes_starved_suspended_store),
+	__ATTR(sync_ratio, 0644, anxiety_sync_ratio_show,
+		anxiety_sync_ratio_store),
+	__ATTR(batch_count, 0644, anxiety_batch_count_show,
+		anxiety_batch_count_store),
 	__ATTR_NULL
 };
 
@@ -222,10 +233,9 @@ static struct elevator_type elevator_anxiety = {
 		.elevator_merge_req_fn	= anxiety_merged_requests,
 		.elevator_dispatch_fn	= anxiety_dispatch,
 		.elevator_add_req_fn	= anxiety_add_request,
-		.elevator_former_req_fn	= anxiety_former_request,
-		.elevator_latter_req_fn	= anxiety_latter_request,
+		.elevator_former_req_fn	= elv_rb_former_request,
+		.elevator_latter_req_fn	= elv_rb_latter_request,
 		.elevator_init_fn	= anxiety_init_queue,
-		.elevator_exit_fn	= anxiety_exit_queue,
 	},
 	.elevator_name = "anxiety",
 	.elevator_attrs = anxiety_attrs,
@@ -246,5 +256,5 @@ module_init(anxiety_init);
 module_exit(anxiety_exit);
 
 MODULE_AUTHOR("Tyler Nijmeh");
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Anxiety IO scheduler");
+MODULE_LICENSE("GPLv3");
+MODULE_DESCRIPTION("Anxiety I/O scheduler");
