@@ -15,7 +15,6 @@
 /dts-v1/;
 
 #include "sdm660.dtsi"
-#include "xiaomi/longcheer/common/longcheer-sdm660-energy.dtsi"
 #include "sdm660-mtp.dtsi"
 #include "sdm660-internal-codec.dtsi"
 
