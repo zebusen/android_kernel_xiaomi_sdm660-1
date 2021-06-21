@@ -3199,15 +3199,6 @@ static unsigned long bfq_bfqq_softrt_next_start(struct bfq_data *bfqd,
 }
 
 /*
- * Return the farthest future time instant according to jiffies
- * macros.
- */
-static unsigned long bfq_greatest_from_now(void)
-{
-	return jiffies + MAX_JIFFY_OFFSET;
-}
-
-/*
  * Return the farthest past time instant according to jiffies
  * macros.
  */
@@ -4717,8 +4708,6 @@ static void bfq_completed_request(struct request_queue *q, struct request *rq)
 	if (!bfqd->rq_in_driver)
 		bfq_schedule_dispatch(bfqd);
 
-out:
-	return;
 }
 
 static int __bfq_may_queue(struct bfq_queue *bfqq)
